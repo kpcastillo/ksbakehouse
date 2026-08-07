@@ -1,87 +1,91 @@
 const express = require('express');
-const { pool } = require('../db');
+const db = require('../db');
 
 const router = express.Router();
 
 // GET /recipes — optional ?category=&search=
-router.get('/', async (req, res) => {
+router.get('/', (req, res) => {
   const { category, search } = req.query;
-  const conditions = [];
+  let query = 'SELECT * FROM recipes';
   const params = [];
+  const conditions = [];
 
   if (category) {
+    conditions.push('category = ?');
     params.push(category);
-    conditions.push(`category = $${params.length}`);
   }
   if (search) {
-    params.push(`%${search}%`);
-    conditions.push(`(title ILIKE $${params.length} OR description ILIKE $${params.length})`);
+    conditions.push('(title LIKE ? OR description LIKE ?)');
+    params.push(`%${search}%`, `%${search}%`);
   }
+  if (conditions.length) query += ' WHERE ' + conditions.join(' AND ');
+  query += ' ORDER BY created_at DESC';
 
-  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
-  const { rows } = await pool.query(
-    `SELECT * FROM recipes ${where} ORDER BY created_at DESC`,
-    params
-  );
-  res.json(rows);
+  const recipes = db.prepare(query).all(...params);
+  res.json(recipes.map(parseRecipe));
 });
 
 // GET /recipes/:id
-router.get('/:id', async (req, res) => {
-  const { rows } = await pool.query('SELECT * FROM recipes WHERE id = $1', [req.params.id]);
-  if (!rows.length) return res.status(404).json({ error: 'Recipe not found' });
-  res.json(rows[0]);
+router.get('/:id', (req, res) => {
+  const recipe = db.prepare('SELECT * FROM recipes WHERE id = ?').get(req.params.id);
+  if (!recipe) return res.status(404).json({ error: 'Recipe not found' });
+  res.json(parseRecipe(recipe));
 });
 
 // POST /recipes
-router.post('/', async (req, res) => {
+router.post('/', (req, res) => {
   const { title, description, category, servings, prep_time, cook_time, ingredients, instructions } = req.body;
   if (!title || !ingredients || !instructions) {
     return res.status(400).json({ error: 'title, ingredients, and instructions are required' });
   }
 
-  const { rows } = await pool.query(
-    `INSERT INTO recipes (title, description, category, servings, prep_time, cook_time, ingredients, instructions)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-     RETURNING *`,
-    [title, description ?? null, category ?? null, servings ?? null,
-     prep_time ?? null, cook_time ?? null, JSON.stringify(ingredients), JSON.stringify(instructions)]
-  );
-  res.status(201).json(rows[0]);
+  const result = db.prepare(`
+    INSERT INTO recipes (title, description, category, servings, prep_time, cook_time, ingredients, instructions)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(title, description ?? null, category ?? null, servings ?? null,
+    prep_time ?? null, cook_time ?? null,
+    JSON.stringify(ingredients), JSON.stringify(instructions));
+
+  const recipe = db.prepare('SELECT * FROM recipes WHERE id = ?').get(result.lastInsertRowid);
+  res.status(201).json(parseRecipe(recipe));
 });
 
 // PATCH /recipes/:id
-router.patch('/:id', async (req, res) => {
+router.patch('/:id', (req, res) => {
+  const existing = db.prepare('SELECT * FROM recipes WHERE id = ?').get(req.params.id);
+  if (!existing) return res.status(404).json({ error: 'Recipe not found' });
+
   const fields = ['title', 'description', 'category', 'servings', 'prep_time', 'cook_time', 'ingredients', 'instructions'];
   const jsonFields = new Set(['ingredients', 'instructions']);
-  const setClauses = [];
+  const updates = [];
   const params = [];
 
   for (const field of fields) {
     if (req.body[field] !== undefined) {
+      updates.push(`${field} = ?`);
       params.push(jsonFields.has(field) ? JSON.stringify(req.body[field]) : req.body[field]);
-      setClauses.push(`${field} = $${params.length}`);
     }
   }
 
-  if (!setClauses.length) return res.status(400).json({ error: 'No valid fields to update' });
+  if (!updates.length) return res.status(400).json({ error: 'No valid fields to update' });
 
+  updates.push("updated_at = datetime('now')");
   params.push(req.params.id);
-  setClauses.push('updated_at = NOW()');
 
-  const { rows } = await pool.query(
-    `UPDATE recipes SET ${setClauses.join(', ')} WHERE id = $${params.length} RETURNING *`,
-    params
-  );
-  if (!rows.length) return res.status(404).json({ error: 'Recipe not found' });
-  res.json(rows[0]);
+  db.prepare(`UPDATE recipes SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+  const recipe = db.prepare('SELECT * FROM recipes WHERE id = ?').get(req.params.id);
+  res.json(parseRecipe(recipe));
 });
 
 // DELETE /recipes/:id
-router.delete('/:id', async (req, res) => {
-  const { rowCount } = await pool.query('DELETE FROM recipes WHERE id = $1', [req.params.id]);
-  if (!rowCount) return res.status(404).json({ error: 'Recipe not found' });
+router.delete('/:id', (req, res) => {
+  const result = db.prepare('DELETE FROM recipes WHERE id = ?').run(req.params.id);
+  if (result.changes === 0) return res.status(404).json({ error: 'Recipe not found' });
   res.status(204).end();
 });
+
+function parseRecipe(r) {
+  return { ...r, ingredients: JSON.parse(r.ingredients), instructions: JSON.parse(r.instructions) };
+}
 
 module.exports = router;
